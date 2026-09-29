@@ -1,0 +1,28 @@
+[package]
+name = "sqlstage"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+license = "MIT"
+description = "Gömülü SQLite dosyalarını kendi okuyucusuyla açan, salt okunur şema görüntüleyici ve SQL konsolu."
+repository = "https://github.com/SyntaxOrigin/sqlstage"
+readme = "README.md"
+keywords = ["cli", "sqlstage", "sqlite", "schema"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+# clap: `src/main.rs` alt komutlarını (schema/query/tables/sample/create/insert/export) elle
+# bayrak ayrıştırmak yerine türetilmiş, tip güvenli bir yapı olarak tanımlar.
+clap = { version = "4", features = ["derive"] }
+# serde: `src/gecmis.rs` geçmiş kaydı ve `src/json_cikti.rs` dışa aktarım gövdesi türetilmiş
+# veri yapıları kullanır (alan adları çıktı sözleşmesidir).
+serde = { version = "1", features = ["derive"] }
+# serde_json: sorgu geçmişi `sorgular.jsonl` satırlarını ve `export` JSON çıktısını yazar.
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "debuginfo"
