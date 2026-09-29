@@ -416,6 +416,15 @@ ortam değişkenidir.
 - **Boş liste (freelist) sayfaları** yalnızca sessizce atlanır; `integrity_check`'in
   aksine ayrıntılı bir boş liste denetimi yapılmaz.
 - **Gizli (freelist/pointer-map) sayfalar** bütünlük denetimine girmez.
+- **Hücre başlıklarında bildirilen boyut alanları güvenilmez kabul edilir ve sınır
+  dışıysa reddedilir.** `varint(yük)` alanı dosyadan gelen ham bir sayıdır; üst sınırı
+  olmadığı için **ne bellek ön-tahsisi için kullanılır ne de okuma sınırı sayılır**.
+  Varışma zinciriyle karşılanamayan boyutlar (dosyada karşılığı olmayan `i64::MAX`,
+  `2^62` gibi değerler) kontrollü bir `bozuk varışma zinciri` hatasıyla reddedilir —
+  araç bellek tüketip çökmez. Negatif boyut alanları sıfıra çevrilir ve kayıt ayrıştırma
+  aşamasında geçersiz başlık hatasına düşer. Yük, varışma sayfaları geldikçe blok blok
+  büyütülen bir tampona yazılır; her sayfa en fazla bir kez ziyaret edilebilir (döngü
+  koruması), dolayısıyla bellek tüketimi dosya boyutuyla sınırlıdır.
 - **Metin harmanlaması (collation)** yalnızca `BINARY`'dir. `NOCASE`, `RTRIM` ve
   `COLLATE` ifadeleri desteklenmez.
 - **`LIKE`** ASCII büyük/küçük harf duyarsızdır ve **kaçış karakteri yoktur** (`%` ve `_`
@@ -453,6 +462,12 @@ ortam değişkenidir.
 5. `NULLS FIRST/LAST`, `COLLATE NOCASE` ve `ESCAPE` desteği.
 6. Sonuç ızgarasında sayfalanmış/lazy yükleme ile bellekten bağımsız büyük sonuçlar.
 7. `WITHOUT ROWID` tablolar için indeks b-tree okuma desteği.
+8. **Varışma yükleri için güvenli ön-tahsis.** Bugün yük tamponu ön-tahsis olmadan,
+   her varışma sayfası geldikçe blok blok büyütülür. Okuyucu dosya boyutunu bildiği
+   için `min(bildirilen_yuk, dosya_boyutu - sayfa_ofseti)` gibi bir tavanla sınırlı
+   ön-tahsis (örneğin 64 KiB'lık dilimler halinde `reserve`) büyük kayıtlarda
+   yeniden kopyalamayı azaltır. Güvenlik gereği bu tavan **dosya boyutundan büyük
+   olamaz**; aksi hâlde `i64::MAX` yazan tek bir hücre yeniden `abort` yolunu açar.
 
 ## Troubleshooting
 

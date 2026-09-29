@@ -28,8 +28,9 @@ pub fn varint_oku(veri: &[u8], baslangic: usize) -> Result<(i64, usize), SahneHa
                 veri.len()
             ),
         })?;
-        if i == 8 {
-            // Dokuzuncu bayt 8 bitinin tamamını taşır.
+        if i == VARINT_EN_FAZLA_BAYT - 1 {
+            // Dokuzuncu bayt 8 bitinin tamamını taşır ve terminal kabul edilir:
+            // yüksek bit set olsa da kodlama burada biter.
             deger = (deger << 8) | u64::from(bayt);
             return Ok((deger as i64, konum + 1));
         }
@@ -38,9 +39,13 @@ pub fn varint_oku(veri: &[u8], baslangic: usize) -> Result<(i64, usize), SahneHa
             return Ok((deger as i64, konum + 1));
         }
     }
-    // Döngü yalnızca dokuzuncu bayta ulaştığında buraya düşer; o yol zaten dönüşle
-    // bittiği için bu noktaya ulaşılamaz.
-    unreachable!("dokuzuncu bayt yolunda zaten dönülür")
+    // Döngü dokuz bayt sınırına ulaştığında yukarıdaki dal zaten dönüş yapar; bu
+    // satır yalnızca döngünün `Result` ile düzgün sonlanmasını sağlar (sözleşme §4.2:
+    // üretim kodunda `panic!` ailesi yoktur).
+    Err(SahneHata::BozukSayfa {
+        sayfa: 0,
+        ayrinti: format!("{VARINT_EN_FAZLA_BAYT} bayt sınırına ulaşıldı ama varint bitmedi"),
+    })
 }
 
 /// Bir `i64` değerini SQLite varint biçiminde yazar.
@@ -196,5 +201,61 @@ mod tests {
             }
             Err(hata) => panic!("beklenmeyen hata: {hata}"),
         }
+    }
+
+    #[test]
+    fn dokuzuncu_bayt_yolu_i64_min_gidis_gelir() {
+        // Regresyon: döngü sonu `unreachable!` ile kapatılmıştı. Dokuzuncu bayt yolu
+        // artık yalnızca `Result` dönüşüyle sonlanır; `i64::MIN` gidiş-dönüşü bunu
+        // doğrular.
+        let baytlar = varint_yaz(i64::MIN);
+        assert_eq!(baytlar.len(), VARINT_EN_FAZLA_BAYT);
+        // İlk sekiz baytın yüksek biti set olmalı, dokuzuncu bayt 8 bit taşımalı.
+        assert!(
+            baytlar[..8].iter().all(|b| b & 0x80 != 0),
+            "ilk sekiz bayt devamlılık biti taşımalı"
+        );
+        assert_eq!(baytlar[8], 0x00, "dokuzuncu bayt 8 bit taşır");
+        assert_eq!(coz(&baytlar), (i64::MIN, VARINT_EN_FAZLA_BAYT));
+        assert_eq!(varint_uzunluk(i64::MIN), VARINT_EN_FAZLA_BAYT);
+    }
+
+    #[test]
+    fn dokuzuncu_bayt_yolu_tam_deger_kumesi() {
+        // Dokuzuncu bayta düşen her değer ailesi: negatifler, 56 bitten büyük
+        // pozitifler ve sınır değerleri.
+        for deger in [
+            i64::MIN,
+            -1,
+            -2_147_483_648,
+            -(1i64 << 55),
+            -(1i64 << 56),
+            1i64 << 56,
+            1i64 << 57,
+            1i64 << 62,
+            i64::MAX,
+        ] {
+            let baytlar = varint_yaz(deger);
+            assert_eq!(
+                baytlar.len(),
+                VARINT_EN_FAZLA_BAYT,
+                "değer {deger} dokuz bayt olmalı"
+            );
+            assert_eq!(
+                coz(&baytlar),
+                (deger, VARINT_EN_FAZLA_BAYT),
+                "değer {deger}"
+            );
+        }
+    }
+
+    #[test]
+    fn dokuz_bayttan_uzun_kodlama_yoktur() {
+        // Onuncu bayta taşmayı gerektiren bir dizi yok sayılmalı: dokuzuncu bayt
+        // terminaldir ve okuma dokuz baytta biter.
+        let veri = [0x80u8; 12];
+        let (deger, sonraki) = coz(&veri);
+        assert_eq!(sonraki, VARINT_EN_FAZLA_BAYT);
+        assert_eq!(deger, 128);
     }
 }

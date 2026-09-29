@@ -7,6 +7,8 @@
 //!
 //! Kaynak: <https://www.sqlite.org/fileformat2.html#record_format>
 
+use std::collections::HashSet;
+
 use crate::baslik::MetinKodlamasi;
 use crate::deger::Deger;
 use crate::hata::SahneHata;
@@ -30,12 +32,17 @@ pub fn yuk_birlestir<F>(
 where
     F: FnMut(u32) -> Result<Vec<u8>, SahneHata>,
 {
+    // `bildirilen_yuk` güvenilmeyen dosyadan gelen ham bir varint'tir ve üst sınırı
+    // yoktur; bu yüzden bellek ön-tahsisi için kullanılamaz. Ön-tahmin yapılsa
+    // `i64::MAX` boyutlu tek bir hücre `handle_alloc_error` ile süreci düşürürdü.
+    // `toplam` yalnızca bir denetim değeridir: veri, her varışma sayfası geldiğinde
+    // o bloğu kapsayacak kadar büyütülür (blok blok büyüme).
     let toplam = usize::try_from(hucre.bildirilen_yuk.max(0)).unwrap_or(0);
-    let mut veri = Vec::with_capacity(toplam);
+    let mut veri = Vec::new();
     veri.extend_from_slice(&hucre.yerel);
 
     let mut sonraki = hucre.varisma_sayfasi;
-    let mut ziyaret = vec![ilk_sayfa];
+    let mut ziyaret = HashSet::from([ilk_sayfa]);
     let mut adim = 0usize;
     while veri.len() < toplam {
         let sayfa_no = sonraki.ok_or_else(|| SahneHata::BozukVarisma {
@@ -49,12 +56,11 @@ where
                 ayrinti: "varışma zinciri 0 (boş) sayfasına devam ediyor".to_string(),
             });
         }
-        if ziyaret.contains(&sayfa_no) {
+        if !ziyaret.insert(sayfa_no) {
             return Err(SahneHata::BozukVarisma {
                 ayrinti: format!("varışma zinciri {sayfa_no} sayfasında döngüye giriyor"),
             });
         }
-        ziyaret.push(sayfa_no);
         adim += 1;
         if adim > 1_000_000 {
             return Err(SahneHata::BozukVarisma {
@@ -69,6 +75,9 @@ where
         }
         sonraki = Some(u32::from_be_bytes([sayfa[0], sayfa[1], sayfa[2], sayfa[3]]));
         let alinacak = (toplam - veri.len()).min(sayfa.len() - 4);
+        // Ön-tahmin yalnızca eldeki blokla sınırlıdır: `alinacak` gerçekten okunacak
+        // bayt sayısıdır, bildirilen yük boyutu değil.
+        veri.reserve(alinacak);
         veri.extend_from_slice(&sayfa[4..4 + alinacak]);
     }
     veri.truncate(toplam);
@@ -318,6 +327,45 @@ fn utf16_coz(baytlar: &[u8], buyuk_endian: bool) -> Result<String, SahneHata> {
 mod tests {
     use super::*;
 
+    use std::collections::HashMap;
+
+    /// Varışma zinciri test verisinin `i` indisindeki baytı (üretilebilir bir desen).
+    fn desen_bayti(i: usize) -> u8 {
+        (i % 251) as u8
+    }
+
+    /// `ilk` sayfa numarasından başlayarak `adet` adet varışma sayfası üretir.
+    ///
+    /// Her sayfa `blok` bayt veri taşır; ilk dört baytında sonraki sayfanın numarası
+    /// (büyük uçlu) bulunur, son sayfada bu alan `0`'dır. Veri, `bas` indisinden
+    /// başlayarak `desen_bayti` deseniyle doldurulur.
+    fn varisma_sayfalari(ilk: u32, blok: usize, adet: usize, bas: usize) -> HashMap<u32, Vec<u8>> {
+        let mut sayfalar = HashMap::new();
+        for i in 0..adet {
+            let no = ilk + i as u32;
+            let sonraki = if i + 1 < adet { ilk + i as u32 + 1 } else { 0 };
+            let mut sayfa = Vec::with_capacity(blok + 4);
+            sayfa.extend_from_slice(&sonraki.to_be_bytes());
+            for j in 0..blok {
+                sayfa.push(desen_bayti(bas + i * blok + j));
+            }
+            sayfalar.insert(no, sayfa);
+        }
+        sayfalar
+    }
+
+    /// Zinciri üreten hücreyi kurar: `yerel` bayt yerel yük + `varisma` sayfa numarası.
+    fn zincir_hucresi(bildirilen_yuk: i64, yerel: Vec<u8>, varisma: Option<u32>) -> Hucre {
+        Hucre {
+            ofset: 0,
+            sol_cocuk: None,
+            anahtar: 1,
+            bildirilen_yuk,
+            yerel,
+            varisma_sayfasi: varisma,
+        }
+    }
+
     #[test]
     fn tum_tipler_gidis_gelir() {
         let girdi = vec![
@@ -526,5 +574,104 @@ mod tests {
         };
         let sonuc = yuk_birlestir(2, &hucre, |_no| Ok(vec![0, 0]));
         assert!(matches!(sonuc, Err(SahneHata::BozukVarisma { .. })));
+    }
+
+    #[test]
+    fn buyuk_varisma_kaydi_blok_blok_okunur() {
+        // Çıktı tamponu tek seferde değil, her varışma sayfası geldiğinde o blok kadar
+        // büyür (zlib'in çıktı tamponu deseni). 120 000 baytlık yük 30 sayfalık bir
+        // zincirden geçerek bayt bayt doğru okunmalıdır.
+        const YEREL: usize = 100;
+        const BLOK: usize = 4092;
+        const ADET: usize = 30;
+        const TOPLAM: usize = 120_000;
+
+        let yerel: Vec<u8> = (0..YEREL).map(desen_bayti).collect();
+        let sayfalar = varisma_sayfalari(5, BLOK, ADET, YEREL);
+        let hucre = zincir_hucresi(TOPLAM as i64, yerel, Some(5));
+
+        let sonuc = yuk_birlestir(2, &hucre, |no| {
+            sayfalar.get(&no).cloned().ok_or(SahneHata::BozukVarisma {
+                ayrinti: format!("sayfa {no} yok"),
+            })
+        });
+        let veri = match sonuc {
+            Ok(v) => v,
+            Err(hata) => panic!("beklenmeyen hata: {hata}"),
+        };
+        assert_eq!(veri.len(), TOPLAM);
+        let beklenen: Vec<u8> = (0..TOPLAM).map(desen_bayti).collect();
+        assert_eq!(veri, beklenen);
+    }
+
+    #[test]
+    fn asiri_buyuk_bildirilen_yuk_araci_dusurmez() {
+        // Regresyon: `bildirilen_yuk` doğrudan `Vec::with_capacity`ye veriliyordu.
+        // 64-bit'te `usize::try_from(i64::MAX)` başarılı olduğu için tek bir bozuk
+        // dosya `handle_alloc_error` ile süreci düşürüyordu. Artık değer yalnızca
+        // denetim sayısıdır: zincir tükenince kontrollü hata döner.
+        for bildirilen in [i64::MAX, 1i64 << 62, 1i64 << 40, 1i64 << 31] {
+            let hucre = zincir_hucresi(bildirilen, vec![1, 2, 3], Some(5));
+            let sonuc = yuk_birlestir(2, &hucre, |no| {
+                if no == 5 {
+                    Ok(vec![0, 0, 0, 6, 4, 5])
+                } else {
+                    Ok(vec![0, 0, 0, 0, 7])
+                }
+            });
+            let hata = match sonuc {
+                Ok(veri) => panic!(
+                    "bildirilen yük {bildirilen} kabul edildi: {} bayt üretildi",
+                    veri.len()
+                ),
+                Err(hata) => hata,
+            };
+            assert!(
+                matches!(hata, SahneHata::BozukVarisma { .. }),
+                "bildirilen yük {bildirilen} için beklenmeyen hata: {hata:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn negatif_bildirilen_yuk_bos_yuk_uretir() {
+        // Negatif (ve sıfır) boyut alanları sınır dışıdır: okuma sınırı olarak
+        // kullanılmaz, toplam sıfır kabul edilir ve tahsis yapılmaz.
+        for bildirilen in [-1i64, i64::MIN, 0] {
+            let hucre = zincir_hucresi(bildirilen, vec![9; 4], Some(5));
+            let sonuc = match yuk_birlestir(2, &hucre, |_no| Ok(vec![0; 16])) {
+                Ok(v) => v,
+                Err(hata) => panic!("beklenmeyen hata: {hata}"),
+            };
+            assert!(
+                sonuc.is_empty(),
+                "bildirilen yük {bildirilen} için {} bayt döndü",
+                sonuc.len()
+            );
+        }
+    }
+
+    #[test]
+    fn varisma_dongusu_kisa_yuklu_hucrede_de_yakalanir() {
+        // Döngü koruması `toplam` boyutundan bağımsız çalışır: bildirilen yük
+        // zincirin sunabileceğinden büyük olsa bile zincir yeniden ziyaret edilirse
+        // hata döner (aksi hâlde sonsuz döngü + bellek taşması olurdu).
+        let hucre = zincir_hucresi(1_000_000, vec![0; 4], Some(5));
+        let sonuc = yuk_birlestir(2, &hucre, |no| {
+            // 5 -> 6 -> 5
+            if no == 5 {
+                Ok(vec![0, 0, 0, 6, 1])
+            } else {
+                Ok(vec![0, 0, 0, 5, 1])
+            }
+        });
+        let hata = match sonuc {
+            Ok(v) => panic!("döngü kabul edildi: {} bayt", v.len()),
+            Err(hata) => hata,
+        };
+        assert!(
+            matches!(hata, SahneHata::BozukVarisma { .. }),
+            "beklenmeyen hata: {hata:?}"
+        );
     }
 }
